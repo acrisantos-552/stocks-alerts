@@ -8,6 +8,13 @@ const {
   COOLDOWN_MIN = 5, DEDUP_EXTRA = 0.5,
   MARKET_OPEN_CST = '08:30', MARKET_CLOSE_CST = '15:00'
 } = process.env;
+const IGNORE_MARKET_HOURS =
+    (process.env.IGNORE_MARKET_HOURS || '').toLowerCase() === 'true' ||
+    process.env.IGNORE_MARKET_HOURS === '1';
+
+const SIM_MODE =
+    (process.env.SIM_MODE || '').toLowerCase() === 'true' ||
+    process.env.SIM_MODE === '1';
 
 const symbols = WATCHLIST.split(',').map(s => s.trim().toUpperCase());
 const wsUrl = `wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`;
@@ -20,6 +27,7 @@ function cdmxNow() {
 }
 
 function inRegularHours() {
+  if (IGNORE_MARKET_HOURS) return true;  // <-- permite pruebas fuera de horario
   const now = cdmxNow();
   const [oh, om] = MARKET_OPEN_CST.split(':').map(Number);
   const [ch, cm] = MARKET_CLOSE_CST.split(':').map(Number);
@@ -66,8 +74,33 @@ function momentumOk(s) {
 }
 
 async function fireAlert({ symbol, price, rule, changePct, severity }) {
-  const payload = { symbol, price, ts: Date.now(), source: 'finnhub', rule, changePct, severity };
-  await fetch(N8N_WEBHOOK_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+  const mode = (process.env.N8N_ENV || 'TEST').toUpperCase();
+  const url = mode === 'PROD'
+      ? process.env.N8N_WEBHOOK_URL_PROD
+      : process.env.N8N_WEBHOOK_URL_TEST;
+
+  const headers = { 'content-type': 'application/json' };
+
+  // Header Auth opcional (si está configurado en n8n)
+  if (process.env.N8N_HEADER_KEY && process.env.N8N_HEADER_VALUE) {
+    headers[process.env.N8N_HEADER_KEY] = process.env.N8N_HEADER_VALUE;
+  }
+
+  const payload = {
+    symbol, price, ts: Date.now(), source: 'finnhub',
+    rule, changePct, severity
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error(`Webhook ${mode} ${res.status}:`, text);
+  }
 }
 
 function maybeAlert(s) {
@@ -98,6 +131,35 @@ function maybeAlert(s) {
     fireAlert({ symbol: s, price: last, rule, changePct: Number(delta.toFixed(2)), severity })
       .catch(err => console.error('Webhook error', err));
   }
+}
+
+function startSimulator() {
+  console.log('SIM MODE ON: generating ticks...');
+  // precio base por símbolo
+  const baseBySym = new Map(symbols.map(s => [s, 100 + Math.random() * 50]));
+
+  setInterval(() => {
+    for (const s of symbols) {
+      let price = baseBySym.get(s);
+
+      // random walk ~±0.1% por segundo
+      const driftPct = (Math.random() - 0.5) * 0.2;
+      price *= (1 + driftPct / 100);
+
+      // spikes ocasionales 2–5% (subida o bajada) para probar alertas
+      if (Math.random() < 0.05) {
+        const spikePct = (Math.random() < 0.5 ? -1 : 1) * (2 + Math.random() * 3);
+        price *= (1 + spikePct / 100);
+      }
+
+      price = Number(price.toFixed(2));
+      baseBySym.set(s, price);
+
+      const t = Date.now();
+      pushPrice(s, t, price);
+      maybeAlert(s);
+    }
+  }, 1000); // 1 tick/seg por símbolo
 }
 
 function connect() {
@@ -134,4 +196,9 @@ function connect() {
   ws.on('error', retry);
 }
 
-connect();
+if (SIM_MODE) {
+  startSimulator();
+} else {
+  connect();
+}
+
