@@ -1,26 +1,34 @@
 import 'dotenv/config';
 import fetch from 'node-fetch';
 import WebSocket from 'ws';
-
 const {
   FINNHUB_TOKEN, N8N_WEBHOOK_URL, WATCHLIST,
   WINDOW_MIN = 10, THRESHLOW = 2, THRESHHIGH = 4,
   COOLDOWN_MIN = 5, DEDUP_EXTRA = 0.5,
   MARKET_OPEN_CST = '08:30', MARKET_CLOSE_CST = '15:00'
 } = process.env;
+
 const IGNORE_MARKET_HOURS =
     (process.env.IGNORE_MARKET_HOURS || '').toLowerCase() === 'true' ||
     process.env.IGNORE_MARKET_HOURS === '1';
-
 const SIM_MODE =
     (process.env.SIM_MODE || '').toLowerCase() === 'true' ||
     process.env.SIM_MODE === '1';
 
 const symbols = WATCHLIST.split(',').map(s => s.trim().toUpperCase());
-const wsUrl = `wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`;
 
+const wsUrl = `wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`;
 const store = new Map();         // por símbolo: { prices: [{t, p}], lastAlert: {pct, t}, hod, lod, cooldownUntil }
+
 const toMs = m => Number(m) * 60 * 1000;
+console.log('[boot]', {
+  file: import.meta.url,
+  cwd: process.cwd(),
+  SIM_MODE,
+  IGNORE_MARKET_HOURS,
+  WATCHLIST: process.env.WATCHLIST,
+  NODE: process.version,
+});
 
 function cdmxNow() {
   return new Date(); // el host ya corre en CDMX; si no, ajustar con tz
