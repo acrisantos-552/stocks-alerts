@@ -1,41 +1,56 @@
+// src/index.js
+// Stock Alerts Daemon — Finnhub WS → Webhook n8n → (Telegram en n8n)
+// Modo SIM opcional para pruebas fuera de horario/fin de semana.
+
 import 'dotenv/config';
-import fetch from 'node-fetch';
 import WebSocket from 'ws';
+import fetch from 'node-fetch';
+
+// --------- Configuración (env) ----------
 const {
-  FINNHUB_TOKEN, N8N_WEBHOOK_URL, WATCHLIST,
-  WINDOW_MIN = 10, THRESHLOW = 2, THRESHHIGH = 4,
-  COOLDOWN_MIN = 5, DEDUP_EXTRA = 0.5,
-  MARKET_OPEN_CST = '08:30', MARKET_CLOSE_CST = '15:00'
+  FINNHUB_TOKEN,
+  N8N_WEBHOOK_URL_TEST,
+  N8N_WEBHOOK_URL_PROD,
+  N8N_ENV = 'TEST',           // TEST | PROD
+  N8N_HEADER_KEY,
+  N8N_HEADER_VALUE,
+  WATCHLIST = 'AAPL,TSLA,PLTR,SPY',
+  WINDOW_MIN = '10',
+  THRESHLOW = '2',
+  THRESHHIGH = '4',
+  COOLDOWN_MIN = '5',
+  DEDUP_EXTRA = '0.5',
+  MARKET_OPEN_CST = '08:30',
+  MARKET_CLOSE_CST = '15:00',
+  SIM_MODE,                   // "1" o "true" para activar simulador
+  IGNORE_MARKET_HOURS,        // "1" o "true" para no bloquear fuera de horario
 } = process.env;
 
-const IGNORE_MARKET_HOURS =
-    (process.env.IGNORE_MARKET_HOURS || '').toLowerCase() === 'true' ||
-    process.env.IGNORE_MARKET_HOURS === '1';
-const SIM_MODE =
-    (process.env.SIM_MODE || '').toLowerCase() === 'true' ||
-    process.env.SIM_MODE === '1';
+const SIM = (SIM_MODE ?? '').toLowerCase() === '1' || (SIM_MODE ?? '').toLowerCase() === 'true';
+const IGNORE_HOURS = (IGNORE_MARKET_HOURS ?? '').toLowerCase() === '1' || (IGNORE_MARKET_HOURS ?? '').toLowerCase() === 'true';
 
-const symbols = WATCHLIST.split(',').map(s => s.trim().toUpperCase());
-
+const symbols = WATCHLIST.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 const wsUrl = `wss://ws.finnhub.io?token=${FINNHUB_TOKEN}`;
-const store = new Map();         // por símbolo: { prices: [{t, p}], lastAlert: {pct, t}, hod, lod, cooldownUntil }
+const mode = (N8N_ENV || 'TEST').toUpperCase();
 
+const store = new Map(); // { [symbol]: { prices:[{t,p}], lastAlert:{pct,t}, hod, lod, cooldownUntil } }
 const toMs = m => Number(m) * 60 * 1000;
+
+// Boot log
 console.log('[boot]', {
-  file: import.meta.url,
-  cwd: process.cwd(),
-  SIM_MODE,
-  IGNORE_MARKET_HOURS,
-  WATCHLIST: process.env.WATCHLIST,
-  NODE: process.version,
+  mode,
+  SIM,
+  IGNORE_HOURS,
+  symbols,
+  node: process.version,
+  wd: process.cwd(),
 });
 
-function cdmxNow() {
-  return new Date(); // el host ya corre en CDMX; si no, ajustar con tz
-}
+// --------- Utilidades ----------
+function cdmxNow() { return new Date(); }
 
 function inRegularHours() {
-  if (IGNORE_MARKET_HOURS) return true;  // <-- permite pruebas fuera de horario
+  if (IGNORE_HOURS || SIM) return true;
   const now = cdmxNow();
   const [oh, om] = MARKET_OPEN_CST.split(':').map(Number);
   const [ch, cm] = MARKET_CLOSE_CST.split(':').map(Number);
@@ -47,12 +62,15 @@ function inRegularHours() {
 function pushPrice(s, t, p) {
   const rec = store.get(s) ?? { prices: [], lastAlert: null, hod: p, lod: p, cooldownUntil: 0 };
   rec.prices.push({ t, p });
+
   // ventana deslizante
   const cutoff = t - toMs(WINDOW_MIN);
   while (rec.prices.length && rec.prices[0].t < cutoff) rec.prices.shift();
+
   // HOD/LOD
   rec.hod = Math.max(rec.hod ?? p, p);
   rec.lod = Math.min(rec.lod ?? p, p);
+
   store.set(s, rec);
 }
 
@@ -78,36 +96,29 @@ function momentumOk(s) {
     }
     prev = p;
   }
-  return sum >= 0.6 && Math.abs(dir) >= 3; // simple, ajustable
+  return sum >= 0.6 && Math.abs(dir) >= 3;
 }
 
 async function fireAlert({ symbol, price, rule, changePct, severity }) {
-  const mode = (process.env.N8N_ENV || 'TEST').toUpperCase();
-  const url = mode === 'PROD'
-      ? process.env.N8N_WEBHOOK_URL_PROD
-      : process.env.N8N_WEBHOOK_URL_TEST;
-
-  const headers = { 'content-type': 'application/json' };
-
-  // Header Auth opcional (si está configurado en n8n)
-  if (process.env.N8N_HEADER_KEY && process.env.N8N_HEADER_VALUE) {
-    headers[process.env.N8N_HEADER_KEY] = process.env.N8N_HEADER_VALUE;
+  const url = mode === 'PROD' ? N8N_WEBHOOK_URL_PROD : N8N_WEBHOOK_URL_TEST;
+  if (!url) {
+    console.error('[alert] N8N webhook URL no configurada (N8N_WEBHOOK_URL_TEST/PROD)');
+    return;
   }
 
-  const payload = {
-    symbol, price, ts: Date.now(), source: 'finnhub',
-    rule, changePct, severity
-  };
+  const headers = { 'content-type': 'application/json' };
+  if (N8N_HEADER_KEY && N8N_HEADER_VALUE) headers[N8N_HEADER_KEY] = N8N_HEADER_VALUE;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-  });
+  const payload = { symbol, price, ts: Date.now(), source: SIM ? 'sim' : 'finnhub', rule, changePct, severity };
 
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    console.error(`Webhook ${mode} ${res.status}:`, text);
+  try {
+    const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      console.error(`[alert] Webhook ${mode} ${res.status}:`, text);
+    }
+  } catch (err) {
+    console.error('[alert] error enviando webhook:', err.message);
   }
 }
 
@@ -115,6 +126,7 @@ function maybeAlert(s) {
   if (!inRegularHours()) return;
   const rec = store.get(s);
   if (!rec || rec.prices.length < 2) return;
+
   const now = Date.now();
   if (now < rec.cooldownUntil) return;
 
@@ -136,14 +148,15 @@ function maybeAlert(s) {
     rec.lastAlert = { pct: delta, t: now };
     rec.cooldownUntil = now + toMs(COOLDOWN_MIN);
     store.set(s, rec);
+
     fireAlert({ symbol: s, price: last, rule, changePct: Number(delta.toFixed(2)), severity })
-      .catch(err => console.error('Webhook error', err));
+        .catch(err => console.error('Webhook error', err));
   }
 }
 
+// --------- Ingesta de precios ----------
 function startSimulator() {
   console.log('SIM MODE ON: generating ticks...');
-  // precio base por símbolo
   const baseBySym = new Map(symbols.map(s => [s, 100 + Math.random() * 50]));
 
   setInterval(() => {
@@ -154,7 +167,7 @@ function startSimulator() {
       const driftPct = (Math.random() - 0.5) * 0.2;
       price *= (1 + driftPct / 100);
 
-      // spikes ocasionales 2–5% (subida o bajada) para probar alertas
+      // spikes ocasionales 2–5% para probar alertas
       if (Math.random() < 0.05) {
         const spikePct = (Math.random() < 0.5 ? -1 : 1) * (2 + Math.random() * 3);
         price *= (1 + spikePct / 100);
@@ -167,18 +180,24 @@ function startSimulator() {
       pushPrice(s, t, price);
       maybeAlert(s);
     }
-  }, 1000); // 1 tick/seg por símbolo
+  }, 1000);
 }
 
-function connect() {
+let wsRef = null;
+
+function connectFinnhub() {
+  if (!FINNHUB_TOKEN) {
+    console.error('[boot] FINNHUB_TOKEN no definido. Usa SIM_MODE=1 para pruebas o configura el token.');
+    process.exitCode = 1;
+    return;
+  }
   const ws = new WebSocket(wsUrl);
+  wsRef = ws;
   let hb = null;
 
   ws.on('open', () => {
-    console.log('WS connected');
-    // suscribir símbolos
+    console.log('Finnhub WS connected →', symbols.join(', '));
     symbols.forEach(sym => ws.send(JSON.stringify({ type: 'subscribe', symbol: sym })));
-    // heartbeat para detectar caídas silenciosas
     hb = setInterval(() => ws.ping?.(), 20_000);
   });
 
@@ -192,21 +211,30 @@ function connect() {
           maybeAlert(s);
         }
       }
-    } catch (e) { /* no-op */ }
+    } catch { /* no-op */ }
   });
 
   const retry = () => {
     if (hb) clearInterval(hb);
-    setTimeout(connect, 2000 + Math.random() * 3000); // backoff simple
+    setTimeout(connectFinnhub, 2000 + Math.random() * 3000);
   };
 
   ws.on('close', retry);
   ws.on('error', retry);
 }
 
-if (SIM_MODE) {
+// Cierre limpio
+function shutdown() {
+  console.log('[shutdown] recibiendo señal, cerrando…');
+  try { wsRef?.close(); } catch {}
+  setTimeout(() => process.exit(0), 250);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// --------- Arranque ----------
+if (SIM) {
   startSimulator();
 } else {
-  connect();
+  connectFinnhub();
 }
-

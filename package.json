@@ -6,5 +6,11 @@
     "ws": "^8.18.0",
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev:sim": "SIM_MODE=1 IGNORE_MARKET_HOURS=1 node src/index.js",
+    "test:webhook": "N8N_ENV=TEST node src/index.js",
+    "prod": "N8N_ENV=PROD node src/index.js"
   }
 }
